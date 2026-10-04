@@ -1,5 +1,6 @@
 import os.path
 import base64
+from time import time
 from markdownify import markdownify as md
 import ollama
 import json
@@ -169,16 +170,35 @@ def main():
                     print(f'  [CACHE HIT] Categorized as: {label_name}')
 
                     label_id = get_or_create_label(service, label_name, label_cache)
+
                     if label_id:
-                        service.users().messages().modify(
-                            userId="me",
-                            id=message["id"],
-                            body={
-                                "addLabelIds": [label_id],
-                                "removeLabelIds": ["INBOX"]
-                            }
-                        ).execute()
-                        print(f"  Moved to {label_name}.")
+                        max_retries = 3
+                        for attempt in range(max_retries):
+                            try:
+                                service.users().messages().modify(
+                                    userId="me",
+                                    id=message["id"],
+                                    body={
+                                        "addLabelIds": [label_id],
+                                        "removeLabelIds": ["INBOX"]
+                                    }
+                                ).execute()
+                                print(f"  Moved to {label_name}.")
+                                break
+                                
+                            except HttpError as error:
+                                if error.resp.status == 400 and "failedPrecondition" in str(error):
+                                    print(f"  [Skipped] Cannot modify message {message['id']} (likely a Draft).")
+                                    sleep_time = 2 ** attempt
+                                    time.sleep(sleep_time)
+                                elif error.resp.status in [429, 500, 502, 503, 504]:
+                                    print(f"  [API Error] Server hiccup on message {message['id']}. Skipping for now.")
+                                    sleep_time = 2 ** attempt
+                                    time.sleep(sleep_time)
+                                else:
+                                    print(f"  [API Error] Unrecoverable error on message {message['id']}: {error}")
+                        else:
+                            print(f"  [Failed] Could not move message {message['id']} to {label_name} after {max_retries} attempts.")
                 else:
                     system_prompt = (
                         "You are a meticulous email categorizer auditing a single isolated email to determine its appropriate category. "
@@ -222,17 +242,35 @@ def main():
                     # Get or create the Gmail label corresponding to the category
                     label_id = get_or_create_label(service, category_name, label_cache)
                     if label_id:
-                        service.users().messages().modify(
-                            userId="me",
-                            id=message["id"],
-                            body={
-                                "addLabelIds": [label_id],
-                                "removeLabelIds": ["INBOX"]
-                            }
-                        ).execute()
-                        print(f"  Moved to {category_name}.")
-                        sender_cache[sender] = category_name
-                        save_sender_cache(sender_cache)
+                        max_retries = 3
+                        for attempt in range(max_retries):
+                            try:
+                                service.users().messages().modify(
+                                    userId="me",
+                                    id=message["id"],
+                                    body={
+                                        "addLabelIds": [label_id],
+                                        "removeLabelIds": ["INBOX"]
+                                    }
+                                ).execute()
+                                print(f"  Moved to {category_name}.")
+                                sender_cache[sender] = category_name
+                                save_sender_cache(sender_cache)
+                                break
+                                
+                            except HttpError as error:
+                                if error.resp.status == 400 and "failedPrecondition" in str(error):
+                                    print(f"  [Skipped] Cannot modify message {message['id']} (likely a Draft).")
+                                    sleep_time = 2 ** attempt
+                                    time.sleep(sleep_time)
+                                elif error.resp.status in [429, 500, 502, 503, 504]:
+                                    print(f"  [API Error] Server hiccup on message {message['id']}. Skipping for now.")
+                                    sleep_time = 2 ** attempt
+                                    time.sleep(sleep_time)
+                                else:
+                                    print(f"  [API Error] Unrecoverable error on message {message['id']}: {error}")
+                        else:
+                            print(f"  [Failed] Could not move message {message['id']} to {category_name} after {max_retries} attempts.")
                 print('')
 
     except HttpError as error:
