@@ -44,7 +44,7 @@ NUM_PREDICT = 10000        # thinking model requires a larger output context win
 # The label to process, by its display name exactly as it appears in Gmail, e.g.
 # "INBOX", "Promotions and Offers", or "Parent/Child" for a nested label.
 # (Matching ignores upper/lower case. A raw ID such as "Label_88" also still works.)
-LABEL_TO_PROCESS = "Promotions and Offers"
+LABEL_TO_PROCESS = "Purchases and Billing"
 
 PAGE_SIZE = 500            # messages fetched per Gmail list request (max 500)
 BATCH_SIZE = 20            # classified messages to collect before writing labels (1-1000)
@@ -87,39 +87,46 @@ CATEGORY_DESCRIPTIONS = {
     ),
     "Finance and Banking": (
         "Bank and credit card statements, loans, investments, retirement accounts, "
-        "and payment account notices. Not store receipts."
+        "and notices about those accounts. Not store receipts, and not bills or "
+        "scheduled payments to service providers such as insurance premiums or toll accounts."
     ),
     "Health and Medical": (
         "Doctor and dental appointments, insurance claims, medical records, "
         "prescriptions, and patient portal messages. Not pet health."
     ),
     "Home and Admin": (
-        "HOA communications, contractor quotes, tax documents, utilities, "
-        "local municipal correspondence, leases, and personal appointments."
+        "HOA communications, contractor quotes, tax documents, utility service "
+        "changes or outages, local municipal correspondence, leases, and personal "
+        "appointments. Not utility, trash, or other service bills."
     ),
 
-    # --- Topic categories (beat generic ones like Purchases/Newsletters) ---
+    # --- Topic categories (beat Newsletters; see priority rules for Purchases/Promotions) ---
     "Pet Care": (
-        "Vet records, rescue adoption paperwork, and supplies for "
-        "Mister Buscits, Mira, and Kittles."
+        "Vet records, pet health, and rescue adoption paperwork for "
+        "Mister Buscits, Mira, and Kittles. Not orders, autoship, or shipping for pet supplies."
     ),
     "Travel and Itineraries": (
         "Vacation details, cruise excursions, campground reservations, "
         "flight tickets, hotel bookings, and rental cars."
     ),
     "Hobbies and Classes": (
-        "Dance studio schedules, performance showcase details, "
-        "convention registrations, and hobby group or club mail."
+        "Schedules and details for classes, studios, and clubs you belong to: dance studio "
+        "schedules, your own performance showcase details, convention registrations, and "
+        "hobby group or club mail. Not advertising from theaters, ballet companies, "
+        "entertainment brands, or venues."
     ),
 
     # --- Generic automated mail ---
     "Purchases and Billing": (
-        "Receipts, delivery tracking, meal kit credits, return confirmations, "
-        "invoices, and subscription charges."
+        "Receipts, orders, autoship orders, delivery and shipping notifications (including "
+        "FedEx, UPS, and USPS), meal kit credits, return confirmations, invoices, "
+        "subscription charges, and bills or scheduled payments for services such as "
+        "insurance premiums, toll accounts, utilities, and trash pickup."
     ),
     "Promotions and Offers": (
         "Marketing sales, discount codes, coupon alerts, retailer loyalty program "
-        "updates, and post-purchase survey or product review requests."
+        "updates, post-purchase survey or product review requests, and advertising for "
+        "shows, performances, seasons, parks, and entertainment brands."
     ),
     "Newsletters and Updates": (
         "Mailing lists, product feature updates, and corporate news blasts "
@@ -154,12 +161,19 @@ When an email fits more than one category, choose using this order:
 2. One-time codes and expiring links (2FA codes, password reset links, email verification
    links, magic sign-in links) go to Junk and Dead Services, even though they are account-related.
 3. Account and Security beats all other automated categories.
-4. Topic categories (Pet Care, Travel and Itineraries, Hobbies and Classes,
+4. Decide what KIND of email it is before considering its topic:
+   - Bills, scheduled or automatic payments, orders, autoship, receipts, and shipping or
+     delivery notices go to Purchases and Billing, even when the topic is pets, insurance,
+     home, utilities, or tolls. Exceptions: travel bookings stay in Travel and Itineraries,
+     and bank or credit card statements stay in Finance and Banking.
+   - Marketing and advertising go to Promotions and Offers, even when the topic matches a
+     hobby (e.g. a ballet company or theme park promoting shows, tickets, or deals).
+5. Otherwise, topic categories (Pet Care, Travel and Itineraries, Hobbies and Classes,
    Health and Medical, School and Work, Finance and Banking, Home and Admin)
    beat generic ones (Purchases and Billing, Promotions and Offers, Newsletters and Updates).
-5. Use Junk and Dead Services for spam, chain mail, defunct services, and the
+6. Use Junk and Dead Services for spam, chain mail, defunct services, and the
    throwaway account mail described in rule 2.
-6. If still unclear, use Needs Review."""
+7. If still unclear, use Needs Review."""
 
 # Gmail's own tab labels, translated for the prompt.
 GMAIL_TABS = {
