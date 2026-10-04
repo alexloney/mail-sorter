@@ -1,6 +1,6 @@
 import os.path
 import base64
-from time import time
+import time
 from markdownify import markdownify as md
 import ollama
 import json
@@ -21,6 +21,27 @@ SCOPES = [
 ]
 
 CACHE_FILE = "sender_cache.json"
+
+LABEL_TO_PROCESS = "INBOX"
+
+ENABLE_CACHE = False
+
+# Place this near the top of your file
+CATEGORY_DESCRIPTIONS = {
+    "Purchases and Billing": "Receipts, delivery tracking, meal kit credits, return confirmations, and invoices.",
+    "Promotions and Offers": "Marketing sales, discount codes, coupon alerts, and retailer loyalty program updates.",
+    "Newsletters and Updates": "General mailing lists, product feature updates, and corporate news blasts.",
+    "Account and Security": "2FA codes, password resets, account verifications, and unrecognized device logins.",
+    "System and Dev Alerts": "Automated home server alerts, Docker/reverse proxy notifications, and GitHub pull request updates.",
+    "Social and Events": "Automated social media pings, generic event invitations, and calendar appointments.",
+    "Surveys and Reviews": "Post-purchase feedback requests and product review prompts.",
+    "Direct Correspondence": "Emails explicitly written by a human directly to you, including friends, family, and Aledyn.",
+    "Travel and Itineraries": "Upcoming vacation details, cruise excursions, campground reservations, and flight tickets.",
+    "Hobbies and Classes": "Dance studio schedules, performance showcase details, and convention registrations.",
+    "Home and Admin": "HOA communications, contractor quotes, tax documents, and local municipal correspondence.",
+    "Pet Care": "Vet records, rescue adoption paperwork, and supplies for Mister Buscits, Mira, and Kittles.",
+    "Needs Review": "Unusual, ambiguous, or highly complex emails that do not clearly fit any of the established categories and require human sorting."
+}
 
 def load_sender_cache():
     if os.path.exists(CACHE_FILE):
@@ -100,7 +121,7 @@ def main():
             # Fetch the current page of up to 500 messages
             results = service.users().messages().list(
                 userId="me", 
-                labelIds=["INBOX"],
+                labelIds=[LABEL_TO_PROCESS],
                 maxResults=500,
                 pageToken=page_token
             ).execute()
@@ -165,9 +186,12 @@ def main():
                 )
                 print(f'  Subject: {safe_snippet}')
 
-                if sender in sender_cache:
+                if ENABLE_CACHE and sender in sender_cache:
                     label_name = sender_cache[sender]
                     print(f'  [CACHE HIT] Categorized as: {label_name}')
+
+                    # Throttle to avoid hitting API rate limits
+                    time.sleep(5)
 
                     label_id = get_or_create_label(service, label_name, label_cache)
 
@@ -180,7 +204,7 @@ def main():
                                     id=message["id"],
                                     body={
                                         "addLabelIds": [label_id],
-                                        "removeLabelIds": ["INBOX"]
+                                        "removeLabelIds": [LABEL_TO_PROCESS]
                                     }
                                 ).execute()
                                 print(f"  Moved to {label_name}.")
@@ -200,37 +224,39 @@ def main():
                         else:
                             print(f"  [Failed] Could not move message {message['id']} to {label_name} after {max_retries} attempts.")
                 else:
+                    # Build the category definitions into a bulleted list string
+                    descriptions_text = "\n".join([f"- '{k}': {v}" for k, v in CATEGORY_DESCRIPTIONS.items()])
+
                     system_prompt = (
-                        "You are a meticulous email categorizer auditing a single isolated email to determine its appropriate category. "
-                        "You have a predefined set of categories: " + ", ".join(map(str, label_cache)) + ". "
-                        "Carefully analyze the email content and assign it to the most appropriate category. "
-                        "If none fit, suggest a new category name. "
-                        "CRITICAL RULES FOR NEW CATEGORIES:\n"
-                        "- Must be 1 to 3 words maximum.\n"
-                        "- Do NOT include explanations, hyphens, or phrases like '(Suggested New Category)'.\n"
-                        "- Examples of valid categories: 'Retail Offers', 'Shipping', 'Newsletters'.\n"
-                        "If you cannot determine a category, output 'Needs Review'."
+                    "You are an exact and meticulous email categorizer. "
+                    "You must classify the provided email into EXACTLY one of the following categories based on their definitions:\n"
+                    f"{descriptions_text}\n\n"
+                    "CRITICAL RULES:\n"
+                    "- Do not invent, suggest, or output any category name that is not strictly in the list above.\n"
+                    "- If an email falls into multiple categories, choose the most specific one.\n"
+                    "- If you cannot determine a category, output 'Needs Review'."
                     )
 
                     schema = {
-                    "type": "object",
-                    "properties": {
-                        "category": {
-                            "type": "string"
+                        "type": "object",
+                        "properties": {
+                            "category": {
+                                "type": "string",
+                                "enum": list(CATEGORY_DESCRIPTIONS.keys())
+                            }
+                        },
+                        "required": ["category"]
                         }
-                    },
-                    "required": ["category"]
-                    }
 
                     response = client.chat(model=model, messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt}
-                    ], format=schema,
-                    options={
-                        "temperature": 0.0, # controls the randomness of the model's output
-                        "num_ctx": 8192, # context window size
-                        "num_predict": 10000 # maximum number of tokens to predict
-                    })
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt}
+                        ], format=schema,
+                        options={
+                            "temperature": 0.0, # controls the randomness of the model's output
+                            "num_ctx": 8192, # context window size
+                            "num_predict": 10000 # maximum number of tokens to predict
+                        })
 
                     # Parse the response from the categorization model
                     raw = (response.message.content or "").strip()
@@ -250,7 +276,7 @@ def main():
                                     id=message["id"],
                                     body={
                                         "addLabelIds": [label_id],
-                                        "removeLabelIds": ["INBOX"]
+                                        "removeLabelIds": [LABEL_TO_PROCESS]
                                     }
                                 ).execute()
                                 print(f"  Moved to {category_name}.")
