@@ -39,11 +39,11 @@ MODEL = "qwen-coder-64k:latest"
 OLLAMA_HOST = "http://localhost:11434"
 OLLAMA_TIMEOUT = 300       # seconds before a single model call is abandoned
 NUM_CTX = 8192             # plenty for ~3,000 chars of body + the system prompt
-NUM_PREDICT = 10000          # thinking model requires a larger output context window
+NUM_PREDICT = 10000        # thinking model requires a larger output context window
 
 LABEL_TO_PROCESS = "Label_88" # "INBOX"
 PAGE_SIZE = 500            # messages fetched per Gmail list request (max 500)
-BATCH_SIZE = 10            # classified messages to collect before writing labels (1-1000)
+BATCH_SIZE = 20            # classified messages to collect before writing labels (1-1000)
 MAX_BODY_CHARS = 3000      # how much of each email body the model sees
 
 LABEL_ROOT = "AI"          # all labels are created as AI/<name>
@@ -71,8 +71,10 @@ CATEGORY_DESCRIPTIONS = {
         "and Aledyn. Personal conversations, not automated mail or mass forwards."
     ),
     "Account and Security": (
-        "2FA codes, password resets, account verifications, signup confirmations, "
-        "and unrecognized device login alerts."
+        "Lasting account records: welcome emails and account-created confirmations "
+        "(proof an account exists), password-changed and recovery-info-changed notices, "
+        "new-device and suspicious login alerts, and account closure confirmations. "
+        "Not one-time codes or expiring links."
     ),
     "School and Work": (
         "Classes, teachers, assignments, school announcements, old jobs, "
@@ -130,7 +132,10 @@ CATEGORY_DESCRIPTIONS = {
     # --- Bulk cleanup and fallback ---
     "Junk and Dead Services": (
         "Spam, chain emails, mass forwards, and mail from defunct or long-abandoned "
-        "early-internet sites, forums, and services. Safe to bulk archive."
+        "early-internet sites, forums, and services. Also throwaway account mail that "
+        "is useless once used or expired: 2FA and one-time codes, password reset links, "
+        "email verification and 'confirm your email' links, and magic sign-in links. "
+        "Safe to bulk archive."
     ),
     "Needs Review": (
         "Unusual, ambiguous, or highly complex emails that do not clearly fit any "
@@ -141,12 +146,15 @@ CATEGORY_DESCRIPTIONS = {
 PRIORITY_RULES = """\
 When an email fits more than one category, choose using this order:
 1. Direct Correspondence beats everything. If a human wrote it to you personally, use it.
-2. Account and Security beats all other automated categories.
-3. Topic categories (Pet Care, Travel and Itineraries, Hobbies and Classes,
+2. One-time codes and expiring links (2FA codes, password reset links, email verification
+   links, magic sign-in links) go to Junk and Dead Services, even though they are account-related.
+3. Account and Security beats all other automated categories.
+4. Topic categories (Pet Care, Travel and Itineraries, Hobbies and Classes,
    Health and Medical, School and Work, Finance and Banking, Home and Admin)
    beat generic ones (Purchases and Billing, Promotions and Offers, Newsletters and Updates).
-4. Use Junk and Dead Services only for spam, chain mail, or defunct services.
-5. If still unclear, use Needs Review."""
+5. Use Junk and Dead Services for spam, chain mail, defunct services, and the
+   throwaway account mail described in rule 2.
+6. If still unclear, use Needs Review."""
 
 # Gmail's own tab labels, translated for the prompt.
 GMAIL_TABS = {
