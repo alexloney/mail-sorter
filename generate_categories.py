@@ -41,7 +41,11 @@ OLLAMA_TIMEOUT = 300       # seconds before a single model call is abandoned
 NUM_CTX = 8192             # plenty for ~3,000 chars of body + the system prompt
 NUM_PREDICT = 10000        # thinking model requires a larger output context window
 
-LABEL_TO_PROCESS = "Label_88" # "INBOX"
+# The label to process, by its display name exactly as it appears in Gmail, e.g.
+# "INBOX", "Promotions and Offers", or "Parent/Child" for a nested label.
+# (Matching ignores upper/lower case. A raw ID such as "Label_88" also still works.)
+LABEL_TO_PROCESS = "Promotions and Offers"
+
 PAGE_SIZE = 500            # messages fetched per Gmail list request (max 500)
 BATCH_SIZE = 20            # classified messages to collect before writing labels (1-1000)
 MAX_BODY_CHARS = 3000      # how much of each email body the model sees
@@ -50,7 +54,8 @@ LABEL_ROOT = "AI"          # all labels are created as AI/<name>
 ADD_YEAR_LABEL = True      # also add AI/Year/<year> (from Gmail's received date)
 SENTIMENTAL_LABEL = f"{LABEL_ROOT}/Sentimental"
 
-# Messages matching any of these are labeled but left in the inbox for you to review.
+# Messages matching any of these are labeled but left where they are for you to review
+# (the label being processed is not removed from them).
 KEEP_IN_INBOX_CATEGORIES = {"Direct Correspondence", "Needs Review"}
 KEEP_SENTIMENTAL_IN_INBOX = True
 KEEP_LOW_CONFIDENCE_IN_INBOX = True
@@ -198,6 +203,7 @@ class Labels:
         self.service = service
         self.by_name = {}        # every label name -> id
         self.legacy_names = {}   # id -> name, for labels you made yourself (prompt hints)
+        self.source_id = None    # ID of the label being processed
         response = service.users().labels().list(userId="me").execute(num_retries=GMAIL_RETRIES)
         for label in response.get("labels", []):
             self.by_name[label["name"]] = label["id"]
@@ -207,6 +213,26 @@ class Labels:
     @staticmethod
     def _is_ours(name):
         return name == LABEL_ROOT or name.startswith(LABEL_ROOT + "/")
+
+    def resolve(self, name):
+        """Turn a label display name (or a raw ID) into a Gmail label ID."""
+        if name in self.by_name:
+            return self.by_name[name]
+        lowered = {n.lower(): i for n, i in self.by_name.items()}
+        if name.lower() in lowered:
+            return lowered[name.lower()]
+        if name in self.by_name.values():      # a raw ID like "Label_88" still works
+            return name
+        available = sorted(n for n in self.by_name if not self._is_ours(n))
+        raise ValueError(
+            f"No Gmail label named {name!r}. Names are matched exactly (ignoring case), "
+            f"and nested labels use 'Parent/Child'.\nAvailable labels:\n  " + "\n  ".join(available)
+        )
+
+    def set_source(self, name):
+        self.source_id = self.resolve(name)
+        self.legacy_names.pop(self.source_id, None)   # not a useful hint for the model
+        return self.source_id
 
     def get_or_create(self, name):
         if name in self.by_name:
@@ -390,7 +416,7 @@ def process_message(service, client, labels, system_prompt, schema, msg_id):
     print(f"  Result:  {data['category']} ({data.get('confidence', '?')})"
           f"{' + Sentimental' if sentimental else ''} - {short(data.get('reason', ''), 150)}")
     if keep:
-        print("           Staying in the inbox for your review.")
+        print("           Staying where it is for your review.")
     print()
 
     return {
@@ -451,7 +477,7 @@ def flush_batch(service, labels, pending, stats):
         add_names = [f"{LABEL_ROOT}/{category}"] + ([SENTIMENTAL_LABEL] if sentimental else [])
         try:
             add_ids = [labels.get_or_create(name) for name in add_names]
-            failed = modify_messages(service, ids, add_ids, [] if keep else [LABEL_TO_PROCESS])
+            failed = modify_messages(service, ids, add_ids, [] if keep else [labels.source_id])
         except HttpError as error:
             failed = set(ids)
             for msg_id in ids:
@@ -462,7 +488,7 @@ def flush_batch(service, labels, pending, stats):
         stats["labeled"] += len(done)
         stats["failed"] += len(failed)
         if done:
-            note = " (kept in inbox)" if keep else ""
+            note = " (left in place)" if keep else ""
             print(f"  {len(done)} x {', '.join(add_names)}{note}")
 
     # Year labels use a separate call per year so they don't fragment the groups above.
@@ -493,6 +519,13 @@ def main():
     service = build("gmail", "v1", credentials=get_creds())
 
     labels = Labels(service)
+    try:
+        source_id = labels.set_source(LABEL_TO_PROCESS)
+    except ValueError as error:
+        print(error)
+        return
+    print(f"Processing label: {LABEL_TO_PROCESS} (id: {source_id})\n")
+
     labels.get_or_create(LABEL_ROOT)                # parent label so AI/... nests in the sidebar
     if ADD_YEAR_LABEL:
         labels.get_or_create(f"{LABEL_ROOT}/Year")
@@ -539,7 +572,7 @@ def main():
             page += 1
             response = service.users().messages().list(
                 userId="me",
-                labelIds=[LABEL_TO_PROCESS],
+                labelIds=[source_id],
                 q=LIST_QUERY,
                 maxResults=PAGE_SIZE,
                 pageToken=page_token,
@@ -578,8 +611,8 @@ def main():
 
             flush_batch(service, labels, pending, stats)   # finish the page before moving on
 
-            # Archiving while paging may make Gmail's cursor skip a few messages.
-            # Anything missed is still unlabeled, so the next run picks it up.
+            # Removing the source label while paging may make Gmail's cursor skip a few
+            # messages. Anything missed is still unlabeled, so the next run picks it up.
             page_token = response.get("nextPageToken")
             if not page_token:
                 print("Reached the last page.")
@@ -598,7 +631,7 @@ def main():
             f"skipped {stats['skipped']} (already sorted), failed {stats['failed']}."
         )
         if stats["failed"]:
-            print(f"Failures are logged in {FAILED_LOG}; they stay in the inbox and retry next run.")
+            print(f"Failures are logged in {FAILED_LOG}; they stay put and retry next run.")
 
 
 if __name__ == "__main__":
