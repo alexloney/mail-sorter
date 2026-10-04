@@ -26,22 +26,90 @@ LABEL_TO_PROCESS = "INBOX"
 
 ENABLE_CACHE = False
 
-# Place this near the top of your file
 CATEGORY_DESCRIPTIONS = {
-    "Purchases and Billing": "Receipts, delivery tracking, meal kit credits, return confirmations, and invoices.",
-    "Promotions and Offers": "Marketing sales, discount codes, coupon alerts, and retailer loyalty program updates.",
-    "Newsletters and Updates": "General mailing lists, product feature updates, and corporate news blasts.",
-    "Account and Security": "2FA codes, password resets, account verifications, and unrecognized device logins.",
-    "System and Dev Alerts": "Automated home server alerts, Docker/reverse proxy notifications, and GitHub pull request updates.",
-    "Social and Events": "Automated social media pings, generic event invitations, and calendar appointments.",
-    "Surveys and Reviews": "Post-purchase feedback requests and product review prompts.",
-    "Direct Correspondence": "Emails explicitly written by a human directly to you, including friends, family, and Aledyn.",
-    "Travel and Itineraries": "Upcoming vacation details, cruise excursions, campground reservations, and flight tickets.",
-    "Hobbies and Classes": "Dance studio schedules, performance showcase details, and convention registrations.",
-    "Home and Admin": "HOA communications, contractor quotes, tax documents, and local municipal correspondence.",
-    "Pet Care": "Vet records, rescue adoption paperwork, and supplies for Mister Buscits, Mira, and Kittles.",
-    "Needs Review": "Unusual, ambiguous, or highly complex emails that do not clearly fit any of the established categories and require human sorting."
+    # --- Human and high-value (checked first) ---
+    "Direct Correspondence": (
+        "Emails written by a real person directly to you, including friends, family, "
+        "and Aledyn. Personal conversations, not automated mail or mass forwards."
+    ),
+    "Account and Security": (
+        "2FA codes, password resets, account verifications, signup confirmations, "
+        "and unrecognized device login alerts."
+    ),
+    "School and Work": (
+        "Classes, teachers, assignments, school announcements, old jobs, "
+        "job applications, resumes, and coworker or employer correspondence."
+    ),
+    "Finance and Banking": (
+        "Bank and credit card statements, loans, investments, retirement accounts, "
+        "and payment account notices. Not store receipts."
+    ),
+    "Health and Medical": (
+        "Doctor and dental appointments, insurance claims, medical records, "
+        "prescriptions, and patient portal messages. Not pet health."
+    ),
+    "Home and Admin": (
+        "HOA communications, contractor quotes, tax documents, utilities, "
+        "local municipal correspondence, leases, and personal appointments."
+    ),
+
+    # --- Topic categories (beat generic ones like Purchases/Newsletters) ---
+    "Pet Care": (
+        "Vet records, rescue adoption paperwork, and supplies for "
+        "Mister Buscits, Mira, and Kittles."
+    ),
+    "Travel and Itineraries": (
+        "Vacation details, cruise excursions, campground reservations, "
+        "flight tickets, hotel bookings, and rental cars."
+    ),
+    "Hobbies and Classes": (
+        "Dance studio schedules, performance showcase details, "
+        "convention registrations, and hobby group or club mail."
+    ),
+
+    # --- Generic automated mail ---
+    "Purchases and Billing": (
+        "Receipts, delivery tracking, meal kit credits, return confirmations, "
+        "invoices, and subscription charges."
+    ),
+    "Promotions and Offers": (
+        "Marketing sales, discount codes, coupon alerts, retailer loyalty program "
+        "updates, and post-purchase survey or product review requests."
+    ),
+    "Newsletters and Updates": (
+        "Mailing lists, product feature updates, and corporate news blasts "
+        "that you subscribed to or that contain real content."
+    ),
+    "Social Notifications": (
+        "Automated social media pings, forum reply notifications, "
+        "and generic event invitations from platforms."
+    ),
+    "System and Dev Alerts": (
+        "Automated home server alerts, Docker/reverse proxy notifications, "
+        "and GitHub pull request updates."
+    ),
+
+    # --- Bulk cleanup and fallback ---
+    "Junk and Dead Services": (
+        "Spam, chain emails, mass forwards, and mail from defunct or long-abandoned "
+        "early-internet sites, forums, and services. Safe to bulk archive."
+    ),
+    "Needs Review": (
+        "Unusual, ambiguous, or highly complex emails that do not clearly fit any "
+        "category and require human sorting."
+    ),
 }
+
+PRIORITY_RULES = """\
+When an email fits more than one category, choose the primary category using this order:
+1. Direct Correspondence beats everything. If a human wrote it to you personally, use it.
+2. Account and Security beats all other automated categories.
+3. Topic categories (Pet Care, Travel and Itineraries, Hobbies and Classes,
+   Health and Medical, School and Work, Finance and Banking, Home and Admin)
+   beat generic ones (Purchases and Billing, Promotions and Offers, Newsletters and Updates).
+4. Use Junk and Dead Services only for spam, chain mail, or defunct services.
+5. If still unclear, use Needs Review.
+You may also return one optional secondary category from the same list."""
 
 def load_sender_cache():
     if os.path.exists(CACHE_FILE):
@@ -234,7 +302,9 @@ def main():
                     "CRITICAL RULES:\n"
                     "- Do not invent, suggest, or output any category name that is not strictly in the list above.\n"
                     "- If an email falls into multiple categories, choose the most specific one.\n"
-                    "- If you cannot determine a category, output 'Needs Review'."
+                    "- If you cannot determine a category, output 'Needs Review'.\n"
+                    "PRIORITY RULES:\n"
+                    f"{PRIORITY_RULES}"
                     )
 
                     schema = {
