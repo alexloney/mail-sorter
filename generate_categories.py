@@ -44,7 +44,7 @@ NUM_PREDICT = 10000        # thinking model requires a larger output context win
 # The label to process, by its display name exactly as it appears in Gmail, e.g.
 # "INBOX", "Promotions and Offers", or "Parent/Child" for a nested label.
 # (Matching ignores upper/lower case. A raw ID such as "Label_88" also still works.)
-LABEL_TO_PROCESS = "Purchases and Billing"
+LABEL_TO_PROCESS = "Unsubscribe"
 
 PAGE_SIZE = 500            # messages fetched per Gmail list request (max 500)
 BATCH_SIZE = 20            # classified messages to collect before writing labels (1-1000)
@@ -175,6 +175,38 @@ When an email fits more than one category, choose using this order:
    throwaway account mail described in rule 2.
 7. If still unclear, use Needs Review."""
 
+_DESCRIPTIONS_TEXT = "\n".join(f"- '{k}': {v}" for k, v in CATEGORY_DESCRIPTIONS.items())
+
+SYSTEM_PROMPT = (
+    "You are an exact and meticulous email categorizer. "
+    "Classify the provided email into EXACTLY one of these categories, based on their definitions:\n"
+    f"{_DESCRIPTIONS_TEXT}\n\n"
+    "RULES:\n"
+    "- Do not invent, suggest, or output any category name that is not strictly in the list above.\n"
+    "- If you cannot determine a category, use 'Needs Review'.\n"
+    "- 'Signals' are hints gathered from the email's headers and the owner's mailbox, not rules. "
+    "Older labels are folders the owner created in the past; treat them as clues about the topic.\n\n"
+    "PRIORITY RULES:\n"
+    f"{PRIORITY_RULES}\n\n"
+    "OUTPUT FIELDS:\n"
+    "- reason: one short sentence explaining the choice.\n"
+    "- category: the category name.\n"
+    "- sentimental: true only for personal or nostalgic email involving real people in the owner's "
+    "life (friends, family, partners), or documents they would regret losing. Always false for automated mail.\n"
+    "- confidence: high, medium, or low."
+)
+
+RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "reason": {"type": "string"},
+        "category": {"type": "string", "enum": list(CATEGORY_DESCRIPTIONS)},
+        "sentimental": {"type": "boolean"},
+        "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+    },
+    "required": ["reason", "category", "sentimental", "confidence"],
+}
+
 # Gmail's own tab labels, translated for the prompt.
 GMAIL_TABS = {
     "CATEGORY_PROMOTIONS": "Promotions",
@@ -266,11 +298,10 @@ class Labels:
 
     def is_sorted(self, message_label_ids):
         """True if the message already has one of our AI/<Category> labels."""
-        for category in CATEGORY_DESCRIPTIONS:
-            label_id = self.by_name.get(f"{LABEL_ROOT}/{category}")
-            if label_id and label_id in message_label_ids:
-                return True
-        return False
+        return any(
+            self.by_name.get(f"{LABEL_ROOT}/{category}") in message_label_ids
+            for category in CATEGORY_DESCRIPTIONS
+        )
 
     def legacy_names_for(self, message_label_ids):
         return sorted(self.legacy_names[i] for i in message_label_ids if i in self.legacy_names)
@@ -366,14 +397,14 @@ def log_failure(msg_id, reason):
         f.write(f"{datetime.now().isoformat()}\t{msg_id}\t{reason}\n")
 
 
-def classify(client, system_prompt, schema, user_prompt):
+def classify(client, user_prompt):
     response = client.chat(
         model=MODEL,
         messages=[
-            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ],
-        format=schema,
+        format=RESPONSE_SCHEMA,
         options={"temperature": 0.0, "num_ctx": NUM_CTX, "num_predict": NUM_PREDICT},
     )
     data = json.loads((response.message.content or "").strip())
@@ -390,7 +421,7 @@ def should_stay_in_inbox(data):
     )
 
 
-def process_message(service, client, labels, system_prompt, schema, msg_id):
+def process_message(service, client, labels, msg_id):
     """Fetch and classify one message. Returns a pending-label dict, or None if skipped."""
     # One call: the raw format already includes labelIds and internalDate.
     msg = service.users().messages().get(userId="me", id=msg_id, format="raw").execute(
@@ -423,7 +454,7 @@ def process_message(service, client, labels, system_prompt, schema, msg_id):
         f"Signals: {signals}\n"
         f"Content:\n{body}\n"
     )
-    data = classify(client, system_prompt, schema, user_prompt)
+    data = classify(client, user_prompt)
 
     keep = should_stay_in_inbox(data)
     sentimental = bool(data.get("sentimental", False))
@@ -544,37 +575,6 @@ def main():
     if ADD_YEAR_LABEL:
         labels.get_or_create(f"{LABEL_ROOT}/Year")
 
-    # The categories are static, so the prompt and schema are built once.
-    descriptions_text = "\n".join(f"- '{k}': {v}" for k, v in CATEGORY_DESCRIPTIONS.items())
-    system_prompt = (
-        "You are an exact and meticulous email categorizer. "
-        "Classify the provided email into EXACTLY one of these categories, based on their definitions:\n"
-        f"{descriptions_text}\n\n"
-        "RULES:\n"
-        "- Do not invent, suggest, or output any category name that is not strictly in the list above.\n"
-        "- If you cannot determine a category, use 'Needs Review'.\n"
-        "- 'Signals' are hints gathered from the email's headers and the owner's mailbox, not rules. "
-        "Older labels are folders the owner created in the past; treat them as clues about the topic.\n\n"
-        "PRIORITY RULES:\n"
-        f"{PRIORITY_RULES}\n\n"
-        "OUTPUT FIELDS:\n"
-        "- reason: one short sentence explaining the choice.\n"
-        "- category: the category name.\n"
-        "- sentimental: true only for personal or nostalgic email involving real people in the owner's "
-        "life (friends, family, partners), or documents they would regret losing. Always false for automated mail.\n"
-        "- confidence: high, medium, or low."
-    )
-    schema = {
-        "type": "object",
-        "properties": {
-            "reason": {"type": "string"},
-            "category": {"type": "string", "enum": list(CATEGORY_DESCRIPTIONS)},
-            "sentimental": {"type": "boolean"},
-            "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
-        },
-        "required": ["reason", "category", "sentimental", "confidence"],
-    }
-
     stats = {"seen": 0, "skipped": 0, "labeled": 0, "failed": 0}
     pending = []
     consecutive_failures = 0
@@ -602,7 +602,7 @@ def main():
                 stats["seen"] += 1
                 print(f"[Page {page} - {index}/{len(messages)}] {ref['id']}")
                 try:
-                    item = process_message(service, client, labels, system_prompt, schema, ref["id"])
+                    item = process_message(service, client, labels, ref["id"])
                 except Exception as error:   # one bad message shouldn't stop the run
                     stats["failed"] += 1
                     consecutive_failures += 1
