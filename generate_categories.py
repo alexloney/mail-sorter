@@ -20,6 +20,7 @@ import ollama
 from bs4 import BeautifulSoup
 from markdownify import markdownify as md
 
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -44,7 +45,7 @@ NUM_PREDICT = 10000        # thinking model requires a larger output context win
 # The label to process, by its display name exactly as it appears in Gmail, e.g.
 # "INBOX", "Promotions and Offers", or "Parent/Child" for a nested label.
 # (Matching ignores upper/lower case. A raw ID such as "Label_88" also still works.)
-LABEL_TO_PROCESS = "Unsubscribe"
+LABEL_TO_PROCESS = "Unsorted Stuff"
 
 PAGE_SIZE = 500            # messages fetched per Gmail list request (max 500)
 BATCH_SIZE = 20            # classified messages to collect before writing labels (1-1000)
@@ -232,8 +233,16 @@ def get_creds():
         creds = Credentials.from_authorized_user_file("token.json", SCOPES)
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+            try:
+                creds.refresh(Request())
+            except RefreshError as e:
+                # Refresh token expired or revoked (e.g. OAuth app in "Testing"
+                # mode expires them after 7 days) -- sign in again.
+                print(f"Stored token could not be refreshed ({e}); re-authorizing...")
+                creds = None
         else:
+            creds = None
+        if creds is None:
             flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
             creds = flow.run_local_server(port=0)
         with open("token.json", "w") as token:
