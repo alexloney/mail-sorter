@@ -35,17 +35,25 @@ SCOPES = [
 ]
 
 # ----------------------------- Settings ---------------------------------------
+# Every email goes to the small, fast model first. If it comes back uncertain (see
+# below), the email is re-classified by the larger model and that answer is used.
+FAST_MODEL = "llama3.1:8b"
 # MODEL = "odytrice/qwen3.8:4090-27b"
 MODEL = "qwen-coder-64k:latest"
 OLLAMA_HOST = "http://localhost:11434"
 OLLAMA_TIMEOUT = 300       # seconds before a single model call is abandoned
 NUM_CTX = 8192             # plenty for ~3,000 chars of body + the system prompt
-NUM_PREDICT = 10000        # thinking model requires a larger output context window
+NUM_PREDICT = 1024         # thinking is disabled, so the JSON answer is all that's generated
+
+# The fast model's answer is "uncertain" (and escalated to MODEL) when its confidence
+# is in this set, when it picks one of these categories, or when its output is invalid.
+ESCALATE_CONFIDENCE = {"medium", "low"}
+ESCALATE_CATEGORIES = {"Needs Review"}
 
 # The label to process, by its display name exactly as it appears in Gmail, e.g.
 # "INBOX", "Promotions and Offers", or "Parent/Child" for a nested label.
 # (Matching ignores upper/lower case. A raw ID such as "Label_88" also still works.)
-LABEL_TO_PROCESS = "Unsorted Stuff"
+LABEL_TO_PROCESS = "Inbox"
 
 PAGE_SIZE = 500            # messages fetched per Gmail list request (max 500)
 BATCH_SIZE = 20            # classified messages to collect before writing labels (1-1000)
@@ -54,6 +62,10 @@ MAX_BODY_CHARS = 3000      # how much of each email body the model sees
 LABEL_ROOT = "AI"          # all labels are created as AI/<name>
 ADD_YEAR_LABEL = True      # also add AI/Year/<year> (from Gmail's received date)
 SENTIMENTAL_LABEL = f"{LABEL_ROOT}/Sentimental"
+
+# When True, classified messages are moved out of LABEL_TO_PROCESS (that label is
+# removed). When False, every message only gets its AI/ labels and stays where it is.
+MOVE_OUT_OF_SOURCE = True
 
 # Messages matching any of these are labeled but left where they are for you to review
 # (the label being processed is not removed from them).
@@ -406,19 +418,45 @@ def log_failure(msg_id, reason):
         f.write(f"{datetime.now().isoformat()}\t{msg_id}\t{reason}\n")
 
 
-def classify(client, user_prompt):
+def classify_with(client, model, user_prompt):
     response = client.chat(
-        model=MODEL,
+        model=model,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ],
         format=RESPONSE_SCHEMA,
+        think=False,
         options={"temperature": 0.0, "num_ctx": NUM_CTX, "num_predict": NUM_PREDICT},
     )
     data = json.loads((response.message.content or "").strip())
     if data.get("category") not in CATEGORY_DESCRIPTIONS:
-        raise ValueError(f"model returned an unknown category: {data.get('category')!r}")
+        raise ValueError(f"{model} returned an unknown category: {data.get('category')!r}")
+    return data
+
+
+def is_uncertain(data):
+    return (
+        data.get("confidence") in ESCALATE_CONFIDENCE
+        or data["category"] in ESCALATE_CATEGORIES
+    )
+
+
+def classify(client, user_prompt):
+    """Try FAST_MODEL first; fall back to MODEL if it is uncertain or its output is invalid."""
+    try:
+        data = classify_with(client, FAST_MODEL, user_prompt)
+    except (ValueError, ollama.ResponseError) as e:  # JSONDecodeError is a ValueError
+        print(f"  {FAST_MODEL} failed ({short(str(e), 100)}) - escalating to {MODEL}.")
+    else:
+        if not is_uncertain(data):
+            data["model"] = FAST_MODEL
+            return data
+        print(f"  {FAST_MODEL} unsure: {data['category']} ({data.get('confidence', '?')})"
+              f" - escalating to {MODEL}.")
+
+    data = classify_with(client, MODEL, user_prompt)
+    data["model"] = MODEL
     return data
 
 
@@ -465,11 +503,11 @@ def process_message(service, client, labels, msg_id):
     )
     data = classify(client, user_prompt)
 
-    keep = should_stay_in_inbox(data)
+    keep = not MOVE_OUT_OF_SOURCE or should_stay_in_inbox(data)
     sentimental = bool(data.get("sentimental", False))
-    print(f"  Result:  {data['category']} ({data.get('confidence', '?')})"
+    print(f"  Result:  {data['category']} ({data.get('confidence', '?')}, {data['model']})"
           f"{' + Sentimental' if sentimental else ''} - {short(data.get('reason', ''), 150)}")
-    if keep:
+    if keep and MOVE_OUT_OF_SOURCE:
         print("           Staying where it is for your review.")
     print()
 
@@ -542,7 +580,7 @@ def flush_batch(service, labels, pending, stats):
         stats["labeled"] += len(done)
         stats["failed"] += len(failed)
         if done:
-            note = " (left in place)" if keep else ""
+            note = " (left in place)" if keep and MOVE_OUT_OF_SOURCE else ""
             print(f"  {len(done)} x {', '.join(add_names)}{note}")
 
     # Year labels use a separate call per year so they don't fragment the groups above.
