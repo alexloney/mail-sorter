@@ -63,6 +63,15 @@ LABEL_ROOT = "AI"          # all labels are created as AI/<name>
 ADD_YEAR_LABEL = True      # also add AI/Year/<year> (from Gmail's received date)
 SENTIMENTAL_LABEL = f"{LABEL_ROOT}/Sentimental"
 
+# Good candidates for Paperless-ngx get one of these on top of their category label.
+PAPERLESS_LABEL = f"{LABEL_ROOT}/Paperless"
+PAPERLESS_ATTACHMENTS_LABEL = f"{PAPERLESS_LABEL}/Attachments"   # the document is attached
+PAPERLESS_EMAIL_LABEL = f"{PAPERLESS_LABEL}/Email"               # the email body is the document
+PAPERLESS_REVIEW_LABEL = f"{PAPERLESS_LABEL}/Review"             # model said archive, but unsure
+PAPERLESS_REVIEW_CONFIDENCE = {"low"}   # paperless confidence that goes to Review instead
+MIN_IMAGE_ATTACHMENT_BYTES = 50_000     # smaller images are treated as logos/signatures
+MAX_ATTACHMENTS_LISTED = 10             # file names shown to the model per email
+
 # When True, classified messages are moved out of LABEL_TO_PROCESS (that label is
 # removed). When False, every message only gets its AI/ labels and stays where it is.
 MOVE_OUT_OF_SOURCE = True
@@ -73,9 +82,14 @@ KEEP_IN_INBOX_CATEGORIES = {"Direct Correspondence", "Needs Review"}
 KEEP_SENTIMENTAL_IN_INBOX = True
 KEEP_LOW_CONFIDENCE_IN_INBOX = True
 
-# Already-labeled messages are skipped. This query keeps most of them out of the
-# listing entirely; the label check inside process_message() is the safety net.
-LIST_QUERY = f"-label:{LABEL_ROOT}"
+# When False, already-labeled messages are skipped. When True, they are classified
+# again and their old AI/<Category>, Sentimental and Paperless labels are replaced
+# (AI/Year labels are kept). Useful for re-running to find Paperless candidates.
+REPROCESS_MAIL = False
+
+# When skipping, this query keeps most labeled messages out of the listing entirely;
+# the label check inside process_message() is the safety net.
+LIST_QUERY = None if REPROCESS_MAIL else f"-label:{LABEL_ROOT}"
 
 GMAIL_RETRIES = 5          # built-in exponential backoff for 429/5xx errors
 MAX_CONSECUTIVE_FAILURES = 5   # stop if this many messages in a row fail
@@ -188,6 +202,25 @@ When an email fits more than one category, choose using this order:
    throwaway account mail described in rule 2.
 7. If still unclear, use Needs Review."""
 
+PAPERLESS_RULES = """\
+Separately from the category, decide whether the email belongs in Paperless-ngx, the owner's
+document archive. Say true only if the email IS a document or carries one that may be useful
+to find in the future:
+- Financial: statements, tax forms (W-2, 1099, 1098), loan and mortgage paperwork, account
+  opening and closure confirmations.
+- Medical: visit summaries, lab results, EOBs (explanations of benefits), vaccination records.
+- Insurance: policies, declarations pages, ID cards, claims.
+- Home and vehicle: leases, closing documents, HOA documents, contractor invoices for work done,
+  registrations, titles, repair records.
+- Pets: vet records, vaccination certificates, adoption and microchip paperwork.
+- Work, school and legal: offer letters, pay stubs, transcripts, signed contracts, official letters.
+- Purchases: receipts for big purchases or anything under warranty.
+Say false for shipping and delivery notices, small orders, promotions, newsletters, one-time
+codes, and 'your statement is ready, log in to view it' emails with nothing attached: a notice
+that a document exists somewhere else is not itself a document.
+The 'Attachments' line lists the real attached files (inline images, logos and calendar invites
+are already removed); use the file names as evidence."""
+
 _DESCRIPTIONS_TEXT = "\n".join(f"- '{k}': {v}" for k, v in CATEGORY_DESCRIPTIONS.items())
 
 SYSTEM_PROMPT = (
@@ -201,12 +234,16 @@ SYSTEM_PROMPT = (
     "Older labels are folders the owner created in the past; treat them as clues about the topic.\n\n"
     "PRIORITY RULES:\n"
     f"{PRIORITY_RULES}\n\n"
+    "PAPERLESS RULES:\n"
+    f"{PAPERLESS_RULES}\n\n"
     "OUTPUT FIELDS:\n"
     "- reason: one short sentence explaining the choice.\n"
     "- category: the category name.\n"
     "- sentimental: true only for personal or nostalgic email involving real people in the owner's "
     "life (friends, family, partners), or documents they would regret losing. Always false for automated mail.\n"
-    "- confidence: high, medium, or low."
+    "- confidence: high, medium, or low.\n"
+    "- paperless: true if the email belongs in Paperless-ngx (see PAPERLESS RULES).\n"
+    "- paperless_confidence: high, medium, or low, for the paperless decision."
 )
 
 RESPONSE_SCHEMA = {
@@ -216,9 +253,15 @@ RESPONSE_SCHEMA = {
         "category": {"type": "string", "enum": list(CATEGORY_DESCRIPTIONS)},
         "sentimental": {"type": "boolean"},
         "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+        "paperless": {"type": "boolean"},
+        "paperless_confidence": {"type": "string", "enum": ["high", "medium", "low"]},
     },
-    "required": ["reason", "category", "sentimental", "confidence"],
+    "required": ["reason", "category", "sentimental", "confidence",
+                 "paperless", "paperless_confidence"],
 }
+
+# Attachments with these types are calendar invites, not documents.
+CALENDAR_TYPES = {"text/calendar", "application/ics"}
 
 # Gmail's own tab labels, translated for the prompt.
 GMAIL_TABS = {
@@ -324,6 +367,13 @@ class Labels:
             for category in CATEGORY_DESCRIPTIONS
         )
 
+    def replaceable_ids(self):
+        """IDs of the labels a reprocessing run replaces (everything we add except AI/Year)."""
+        names = [f"{LABEL_ROOT}/{category}" for category in CATEGORY_DESCRIPTIONS]
+        names += [SENTIMENTAL_LABEL, PAPERLESS_ATTACHMENTS_LABEL,
+                  PAPERLESS_EMAIL_LABEL, PAPERLESS_REVIEW_LABEL]
+        return {self.by_name[name] for name in names if name in self.by_name}
+
     def legacy_names_for(self, message_label_ids):
         return sorted(self.legacy_names[i] for i in message_label_ids if i in self.legacy_names)
 
@@ -382,6 +432,39 @@ def extract_body_text(parsed):
         return ""
 
 
+def list_attachments(parsed):
+    """File names of real attachments, skipping inline images, small logos, and calendar invites."""
+    found = []
+    try:
+        for part in parsed.walk():
+            if part.is_multipart():
+                continue
+            content_type = part.get_content_type()
+            filename = strip_invisible(part.get_filename() or "").strip()
+            disposition = part.get_content_disposition()   # 'attachment', 'inline', or None
+            if not filename and disposition != "attachment":
+                continue                                    # body text, not a file
+            if content_type in CALENDAR_TYPES or filename.lower().endswith((".ics", ".vcs")):
+                continue
+            if content_type.startswith("image/"):
+                size = len(part.get_payload(decode=True) or b"")
+                embedded = disposition != "attachment" and part["Content-ID"]
+                if embedded or size < MIN_IMAGE_ATTACHMENT_BYTES:
+                    continue
+            found.append(filename or f"(unnamed {content_type})")
+    except Exception:
+        pass
+    return found
+
+
+def attachments_text(attachments):
+    if not attachments:
+        return "none"
+    text = ", ".join(short(name, 80) for name in attachments[:MAX_ATTACHMENTS_LISTED])
+    extra = len(attachments) - MAX_ATTACHMENTS_LISTED
+    return text + (f" (+{extra} more)" if extra > 0 else "")
+
+
 def received_date(msg):
     try:
         return datetime.fromtimestamp(int(msg["internalDate"]) / 1000, tz=timezone.utc)
@@ -438,6 +521,7 @@ def classify_with(client, model, user_prompt):
 def is_uncertain(data):
     return (
         data.get("confidence") in ESCALATE_CONFIDENCE
+        or data.get("paperless_confidence") in ESCALATE_CONFIDENCE
         or data["category"] in ESCALATE_CATEGORIES
     )
 
@@ -468,6 +552,15 @@ def should_stay_in_inbox(data):
     )
 
 
+def paperless_label(data, attachments):
+    """Which AI/Paperless/... label the message gets, or None."""
+    if not data.get("paperless"):
+        return None
+    if data.get("paperless_confidence") in PAPERLESS_REVIEW_CONFIDENCE:
+        return PAPERLESS_REVIEW_LABEL
+    return PAPERLESS_ATTACHMENTS_LABEL if attachments else PAPERLESS_EMAIL_LABEL
+
+
 def process_message(service, client, labels, msg_id):
     """Fetch and classify one message. Returns a pending-label dict, or None if skipped."""
     # One call: the raw format already includes labelIds and internalDate.
@@ -475,7 +568,7 @@ def process_message(service, client, labels, msg_id):
         num_retries=GMAIL_RETRIES
     )
     label_ids = set(msg.get("labelIds", []))
-    if labels.is_sorted(label_ids):
+    if not REPROCESS_MAIL and labels.is_sorted(label_ids):
         print("  Already sorted - skipping.\n")
         return None
 
@@ -489,24 +582,31 @@ def process_message(service, client, labels, msg_id):
     date_text = date.strftime("%Y-%m-%d") if date else "unknown"
     signals = build_signals(parsed, label_ids, labels)
     body = extract_body_text(parsed)[:MAX_BODY_CHARS] or "(no readable text)"
+    attachments = list_attachments(parsed)
+    attachment_line = attachments_text(attachments)
 
     print(f"  From:    {short(sender)}")
     print(f"  Subject: {short(subject)}")
     print(f"  Signals: {short(signals, 160)}")
+    if attachments:
+        print(f"  Attach:  {short(attachment_line, 160)}")
 
     user_prompt = (
         f"From: {sender}\n"
         f"Date: {date_text}\n"
         f"Subject: {subject}\n"
         f"Signals: {signals}\n"
+        f"Attachments: {attachment_line}\n"
         f"Content:\n{body}\n"
     )
     data = classify(client, user_prompt)
 
     keep = not MOVE_OUT_OF_SOURCE or should_stay_in_inbox(data)
     sentimental = bool(data.get("sentimental", False))
+    paperless = paperless_label(data, attachments)
     print(f"  Result:  {data['category']} ({data.get('confidence', '?')}, {data['model']})"
-          f"{' + Sentimental' if sentimental else ''} - {short(data.get('reason', ''), 150)}")
+          f"{' + Sentimental' if sentimental else ''}"
+          f"{f' + {paperless}' if paperless else ''} - {short(data.get('reason', ''), 150)}")
     if keep and MOVE_OUT_OF_SOURCE:
         print("           Staying where it is for your review.")
     print()
@@ -515,6 +615,7 @@ def process_message(service, client, labels, msg_id):
         "id": msg_id,
         "category": data["category"],
         "sentimental": sentimental,
+        "paperless": paperless,
         "keep": keep,
         "year": date.year if date else None,
     }
@@ -561,15 +662,21 @@ def flush_batch(service, labels, pending, stats):
 
     groups = defaultdict(list)
     for item in pending:
-        groups[(item["category"], item["sentimental"], item["keep"])].append(item)
+        groups[(item["category"], item["sentimental"], item["paperless"], item["keep"])].append(item)
 
     applied = []
-    for (category, sentimental, keep), items in groups.items():
+    for (category, sentimental, paperless, keep), items in groups.items():
         ids = [item["id"] for item in items]
         add_names = [f"{LABEL_ROOT}/{category}"] + ([SENTIMENTAL_LABEL] if sentimental else [])
+        if paperless:
+            add_names.append(paperless)
         try:
             add_ids = [labels.get_or_create(name) for name in add_names]
-            failed = modify_messages(service, ids, add_ids, [] if keep else [labels.source_id])
+            remove_ids = set() if keep else {labels.source_id}
+            if REPROCESS_MAIL:
+                remove_ids |= labels.replaceable_ids()      # drop the previous run's labels
+            remove_ids -= set(add_ids)                      # Gmail rejects add+remove of one label
+            failed = modify_messages(service, ids, add_ids, sorted(remove_ids))
         except HttpError as error:
             failed = set(ids)
             for msg_id in ids:
@@ -616,9 +723,13 @@ def main():
     except ValueError as error:
         print(error)
         return
-    print(f"Processing label: {LABEL_TO_PROCESS} (id: {source_id})\n")
+    print(f"Processing label: {LABEL_TO_PROCESS} (id: {source_id})")
+    if REPROCESS_MAIL:
+        print("Reprocessing: already-labeled messages will be classified again.")
+    print()
 
     labels.get_or_create(LABEL_ROOT)                # parent label so AI/... nests in the sidebar
+    labels.get_or_create(PAPERLESS_LABEL)
     if ADD_YEAR_LABEL:
         labels.get_or_create(f"{LABEL_ROOT}/Year")
 
