@@ -518,12 +518,16 @@ def classify_with(client, model, user_prompt):
     return data
 
 
-def is_uncertain(data):
-    return (
-        data.get("confidence") in ESCALATE_CONFIDENCE
-        or data.get("paperless_confidence") in ESCALATE_CONFIDENCE
-        or data["category"] in ESCALATE_CATEGORIES
-    )
+def uncertainty_reason(data):
+    """Why the fast model's answer should be escalated, or None if it is good enough."""
+    if data["category"] in ESCALATE_CATEGORIES:
+        return f"chose {data['category']}"
+    if data.get("confidence") in ESCALATE_CONFIDENCE:
+        return f"{data['category']} ({data['confidence']})"
+    # Small models are rarely sure that a promo is NOT a document, so only a "yes" counts here.
+    if data.get("paperless") and data.get("paperless_confidence") in ESCALATE_CONFIDENCE:
+        return f"Paperless candidate ({data['paperless_confidence']})"
+    return None
 
 
 def classify(client, user_prompt):
@@ -533,11 +537,11 @@ def classify(client, user_prompt):
     except (ValueError, ollama.ResponseError) as e:  # JSONDecodeError is a ValueError
         print(f"  {FAST_MODEL} failed ({short(str(e), 100)}) - escalating to {MODEL}.")
     else:
-        if not is_uncertain(data):
+        reason = uncertainty_reason(data)
+        if reason is None:
             data["model"] = FAST_MODEL
             return data
-        print(f"  {FAST_MODEL} unsure: {data['category']} ({data.get('confidence', '?')})"
-              f" - escalating to {MODEL}.")
+        print(f"  {FAST_MODEL} unsure: {reason} - escalating to {MODEL}.")
 
     data = classify_with(client, MODEL, user_prompt)
     data["model"] = MODEL
