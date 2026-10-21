@@ -49,6 +49,7 @@ NUM_PREDICT = 1024         # thinking is disabled, so the JSON answer is all tha
 # is in this set, when it picks one of these categories, or when its output is invalid.
 ESCALATE_CONFIDENCE = {"medium", "low"}
 ESCALATE_CATEGORIES = {"Needs Review"}
+ESCALATE_IN_BODY_DOCUMENTS = True   # double-check "the email body is the document" answers
 
 # The label to process, by its display name exactly as it appears in Gmail, e.g.
 # "INBOX", "Promotions and Offers", or "Parent/Child" for a nested label.
@@ -204,8 +205,8 @@ When an email fits more than one category, choose using this order:
 
 PAPERLESS_RULES = """\
 Separately from the category, decide whether the email belongs in Paperless-ngx, the owner's
-document archive. Say true only if the email IS a document or carries one that may be useful
-to find in the future:
+document archive. It belongs there only if the email IS a document or carries one that may be
+useful to find in the future:
 - Financial: statements, tax forms (W-2, 1099, 1098), loan and mortgage paperwork, account
   opening and closure confirmations.
 - Medical: visit summaries, lab results, EOBs (explanations of benefits), vaccination records.
@@ -215,9 +216,18 @@ to find in the future:
 - Pets: vet records, vaccination certificates, adoption and microchip paperwork.
 - Work, school and legal: offer letters, pay stubs, transcripts, signed contracts, official letters.
 - Purchases: receipts for big purchases or anything under warranty.
-Say false for shipping and delivery notices, small orders, promotions, newsletters, one-time
-codes, and 'your statement is ready, log in to view it' emails with nothing attached: a notice
-that a document exists somewhere else is not itself a document.
+Shipping and delivery notices, small orders, promotions, newsletters, and one-time codes do
+not belong there.
+Then say WHERE the document is, as paperless_document:
+- 'attached': a document file appears on the 'Attachments' line. If that line says 'none',
+  never answer 'attached'.
+- 'in_body': the email text itself contains the document's actual details, e.g. a full
+  receipt with items and prices, policy numbers and coverage, or the text of an official letter.
+- 'only_via_link': the email only announces that a document is ready, available, or can be
+  viewed or downloaded by clicking a link or logging in. Example: 'Your new statement is ready
+  to be downloaded from your account' with no attachment is 'only_via_link', even though the
+  statement itself would be worth keeping. Mentioning a document is not the same as containing it.
+- 'none': no document worth keeping.
 The 'Attachments' line lists the real attached files (inline images, logos and calendar invites
 are already removed); use the file names as evidence."""
 
@@ -242,8 +252,8 @@ SYSTEM_PROMPT = (
     "- sentimental: true only for personal or nostalgic email involving real people in the owner's "
     "life (friends, family, partners), or documents they would regret losing. Always false for automated mail.\n"
     "- confidence: high, medium, or low.\n"
-    "- paperless: true if the email belongs in Paperless-ngx (see PAPERLESS RULES).\n"
-    "- paperless_confidence: high, medium, or low, for the paperless decision."
+    "- paperless_document: attached, in_body, only_via_link, or none (see PAPERLESS RULES).\n"
+    "- paperless_confidence: high, medium, or low, for the paperless_document answer."
 )
 
 RESPONSE_SCHEMA = {
@@ -253,12 +263,17 @@ RESPONSE_SCHEMA = {
         "category": {"type": "string", "enum": list(CATEGORY_DESCRIPTIONS)},
         "sentimental": {"type": "boolean"},
         "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
-        "paperless": {"type": "boolean"},
+        "paperless_document": {
+            "type": "string", "enum": ["attached", "in_body", "only_via_link", "none"],
+        },
         "paperless_confidence": {"type": "string", "enum": ["high", "medium", "low"]},
     },
     "required": ["reason", "category", "sentimental", "confidence",
-                 "paperless", "paperless_confidence"],
+                 "paperless_document", "paperless_confidence"],
 }
+
+# paperless_document answers that earn an AI/Paperless/... label.
+ARCHIVE_DOCUMENTS = {"attached", "in_body"}
 
 # Attachments with these types are calendar invites, not documents.
 CALENDAR_TYPES = {"text/calendar", "application/ics"}
@@ -524,9 +539,13 @@ def uncertainty_reason(data):
         return f"chose {data['category']}"
     if data.get("confidence") in ESCALATE_CONFIDENCE:
         return f"{data['category']} ({data['confidence']})"
+    document = data.get("paperless_document")
     # Small models are rarely sure that a promo is NOT a document, so only a "yes" counts here.
-    if data.get("paperless") and data.get("paperless_confidence") in ESCALATE_CONFIDENCE:
+    if document in ARCHIVE_DOCUMENTS and data.get("paperless_confidence") in ESCALATE_CONFIDENCE:
         return f"Paperless candidate ({data['paperless_confidence']})"
+    # Body-as-document answers are rare and easy to get wrong (e.g. "statement ready" notices).
+    if ESCALATE_IN_BODY_DOCUMENTS and document == "in_body":
+        return "email body is the document"
     return None
 
 
@@ -558,8 +577,11 @@ def should_stay_in_inbox(data):
 
 def paperless_label(data, attachments):
     """Which AI/Paperless/... label the message gets, or None."""
-    if not data.get("paperless"):
-        return None
+    document = data.get("paperless_document")
+    if document not in ARCHIVE_DOCUMENTS:
+        return None                                  # nothing here, or only behind a link
+    if document == "attached" and not attachments:
+        return PAPERLESS_REVIEW_LABEL                # model claims a file we couldn't find
     if data.get("paperless_confidence") in PAPERLESS_REVIEW_CONFIDENCE:
         return PAPERLESS_REVIEW_LABEL
     return PAPERLESS_ATTACHMENTS_LABEL if attachments else PAPERLESS_EMAIL_LABEL
