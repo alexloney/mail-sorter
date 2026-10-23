@@ -4,6 +4,10 @@ Gmail inbox categorizer (v2).
 Walks the inbox page by page, asks a local Ollama model to categorize each email,
 and applies nested AI/<Category> labels in batches. Messages that already carry an
 AI/<Category> label are skipped, so the script is safe to stop and re-run.
+
+Run modes (see RUN_MODE):
+  python categorize.py           label the mail already in LABEL_TO_PROCESS, then exit
+  python categorize.py watch     stay running and label new mail as it arrives
 """
 import base64
 import email
@@ -11,6 +15,7 @@ import json
 import os.path
 import re
 import sys
+import time
 import unicodedata
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -55,6 +60,14 @@ ESCALATE_IN_BODY_DOCUMENTS = True   # double-check "the email body is the docume
 # "INBOX", "Promotions and Offers", or "Parent/Child" for a nested label.
 # (Matching ignores upper/lower case. A raw ID such as "Label_88" also still works.)
 LABEL_TO_PROCESS = "Inbox"
+
+# "backfill": walk every message already in LABEL_TO_PROCESS once, then exit.
+# "watch": stay running and label each new message that arrives in LABEL_TO_PROCESS.
+#          Watched messages are never moved out of it (MOVE_OUT_OF_SOURCE is ignored).
+# Passing "watch" or "backfill" on the command line overrides this.
+RUN_MODE = "backfill"
+WATCH_POLL_SECONDS = 60    # how often watch mode asks Gmail for new mail
+WATCH_MAX_ATTEMPTS = 3     # polls a failing message is retried on before giving up
 
 PAGE_SIZE = 500            # messages fetched per Gmail list request (max 500)
 BATCH_SIZE = 20            # classified messages to collect before writing labels (1-1000)
@@ -146,7 +159,8 @@ CATEGORY_DESCRIPTIONS = {
 
     # --- Generic automated mail ---
     "Purchases and Billing": (
-        "Receipts, orders, autoship orders, delivery and shipping notifications (including "
+        "Receipts, orders, preorders and preorder status updates, autoship orders, "
+        "delivery and shipping notifications (including "
         "FedEx, UPS, and USPS), meal kit credits, return confirmations, invoices, "
         "subscription charges, and bills or scheduled payments for services such as "
         "insurance premiums, toll accounts, utilities, and trash pickup."
@@ -190,12 +204,14 @@ When an email fits more than one category, choose using this order:
    links, magic sign-in links) go to Junk and Dead Services, even though they are account-related.
 3. Account and Security beats all other automated categories.
 4. Decide what KIND of email it is before considering its topic:
-   - Bills, scheduled or automatic payments, orders, autoship, receipts, and shipping or
-     delivery notices go to Purchases and Billing, even when the topic is pets, insurance,
+   - Bills, scheduled or automatic payments, orders, preorders, autoship, receipts, and shipping
+     or delivery notices go to Purchases and Billing, even when the topic is pets, insurance,
      home, utilities, or tolls. Exceptions: travel bookings stay in Travel and Itineraries,
      and bank or credit card statements stay in Finance and Banking.
    - Marketing and advertising go to Promotions and Offers, even when the topic matches a
      hobby (e.g. a ballet company or theme park promoting shows, tickets, or deals).
+     An email about something the owner already ordered or preordered (status, charge,
+     release date, cancellation) is NOT a promotion, even if it names a product or brand.
 5. Otherwise, topic categories (Pet Care, Travel and Itineraries, Hobbies and Classes,
    Health and Medical, School and Work, Finance and Banking, Home and Admin)
    beat generic ones (Purchases and Billing, Promotions and Offers, Newsletters and Updates).
@@ -587,7 +603,7 @@ def paperless_label(data, attachments):
     return PAPERLESS_ATTACHMENTS_LABEL if attachments else PAPERLESS_EMAIL_LABEL
 
 
-def process_message(service, client, labels, msg_id):
+def process_message(service, client, labels, msg_id, move_out=MOVE_OUT_OF_SOURCE):
     """Fetch and classify one message. Returns a pending-label dict, or None if skipped."""
     # One call: the raw format already includes labelIds and internalDate.
     msg = service.users().messages().get(userId="me", id=msg_id, format="raw").execute(
@@ -627,13 +643,13 @@ def process_message(service, client, labels, msg_id):
     )
     data = classify(client, user_prompt)
 
-    keep = not MOVE_OUT_OF_SOURCE or should_stay_in_inbox(data)
+    keep = not move_out or should_stay_in_inbox(data)
     sentimental = bool(data.get("sentimental", False))
     paperless = paperless_label(data, attachments)
     print(f"  Result:  {data['category']} ({data.get('confidence', '?')}, {data['model']})"
           f"{' + Sentimental' if sentimental else ''}"
           f"{f' + {paperless}' if paperless else ''} - {short(data.get('reason', ''), 150)}")
-    if keep and MOVE_OUT_OF_SOURCE:
+    if keep and move_out:
         print("           Staying where it is for your review.")
     print()
 
@@ -734,31 +750,10 @@ def flush_batch(service, labels, pending, stats):
     pending.clear()
 
 
-# ----------------------------- Main -------------------------------------------
-def main():
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(errors="replace")   # odd subject characters can't crash printing
-
+# ----------------------------- Backfill mode ----------------------------------
+def run_backfill(service, client, labels, source_id):
+    """Walk every message already in the source label, then return."""
     batch_size = max(1, min(BATCH_SIZE, 1000))
-    client = ollama.Client(host=OLLAMA_HOST, timeout=OLLAMA_TIMEOUT)
-    service = build("gmail", "v1", credentials=get_creds())
-
-    labels = Labels(service)
-    try:
-        source_id = labels.set_source(LABEL_TO_PROCESS)
-    except ValueError as error:
-        print(error)
-        return
-    print(f"Processing label: {LABEL_TO_PROCESS} (id: {source_id})")
-    if REPROCESS_MAIL:
-        print("Reprocessing: already-labeled messages will be classified again.")
-    print()
-
-    labels.get_or_create(LABEL_ROOT)                # parent label so AI/... nests in the sidebar
-    labels.get_or_create(PAPERLESS_LABEL)
-    if ADD_YEAR_LABEL:
-        labels.get_or_create(f"{LABEL_ROOT}/Year")
-
     stats = {"seen": 0, "skipped": 0, "labeled": 0, "failed": 0}
     pending = []
     consecutive_failures = 0
@@ -830,6 +825,133 @@ def main():
         )
         if stats["failed"]:
             print(f"Failures are logged in {FAILED_LOG}; they stay put and retry next run.")
+
+
+# ----------------------------- Watch mode -------------------------------------
+def current_history_id(service):
+    profile = service.users().getProfile(userId="me").execute(num_retries=GMAIL_RETRIES)
+    return profile["historyId"]
+
+
+def new_message_ids(service, source_id, history_id):
+    """IDs of messages that arrived in the source label since history_id, and the new history ID."""
+    found = {}   # dict keeps arrival order and drops duplicates
+    page_token = None
+    while True:
+        response = service.users().history().list(
+            userId="me",
+            startHistoryId=history_id,
+            labelId=source_id,
+            historyTypes=["messageAdded"],
+            pageToken=page_token,
+        ).execute(num_retries=GMAIL_RETRIES)
+        for record in response.get("history", []):
+            for added in record.get("messagesAdded", []):
+                message = added["message"]
+                if source_id in message.get("labelIds", []):   # skips sent mail and drafts
+                    found[message["id"]] = None
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            return list(found), response.get("historyId", history_id)
+
+
+def run_watch(service, client, labels, source_id):
+    """Stay running, labeling each new message in the source label without moving it."""
+    stats = {"seen": 0, "skipped": 0, "labeled": 0, "failed": 0}
+    attempts = {}   # message ID -> failed attempts so far, retried on the next poll
+    history_id = current_history_id(service)
+    print(f"Watching for new mail every {WATCH_POLL_SECONDS}s. Press Ctrl+C to stop.\n")
+
+    try:
+        while True:
+            time.sleep(WATCH_POLL_SECONDS)
+            try:
+                new_ids, history_id = new_message_ids(service, source_id, history_id)
+            except HttpError as error:
+                if error.resp.status != 404:
+                    print(f"Gmail error while checking for new mail: {error} - will try again.")
+                    continue
+                # Gmail only keeps about a week of history (e.g. the PC was asleep that long).
+                print("Gmail's change history expired; watching from now on. "
+                      "Run in backfill mode to label anything missed.")
+                history_id = current_history_id(service)
+                continue
+            except Exception as error:   # network drop, etc. - the watcher should survive it
+                print(f"Could not check for new mail ({type(error).__name__}: {error}) - will try again.")
+                continue
+
+            to_process = list(dict.fromkeys(list(attempts) + new_ids))
+            if not to_process:
+                continue
+            print(f"=== {datetime.now():%Y-%m-%d %H:%M:%S}: {len(to_process)} new message(s) ===\n")
+
+            pending = []
+            for index, msg_id in enumerate(to_process, start=1):
+                stats["seen"] += 1
+                print(f"[{index}/{len(to_process)}] {msg_id}")
+                try:
+                    item = process_message(service, client, labels, msg_id, move_out=False)
+                except Exception as error:   # retry on the next poll, up to WATCH_MAX_ATTEMPTS
+                    attempts[msg_id] = attempts.get(msg_id, 0) + 1
+                    log_failure(msg_id, f"{type(error).__name__}: {error}")
+                    if attempts[msg_id] >= WATCH_MAX_ATTEMPTS:
+                        print(f"  Giving up after {WATCH_MAX_ATTEMPTS} attempts.")
+                        stats["failed"] += 1
+                        del attempts[msg_id]
+                    print()
+                    continue
+
+                attempts.pop(msg_id, None)
+                if item is None:
+                    stats["skipped"] += 1
+                else:
+                    pending.append(item)
+            flush_batch(service, labels, pending, stats)
+
+    except KeyboardInterrupt:
+        print("\nStopped watching.")
+    finally:
+        print(
+            f"Seen {stats['seen']}, labeled {stats['labeled']}, "
+            f"skipped {stats['skipped']} (already sorted), failed {stats['failed']}."
+        )
+        if stats["failed"]:
+            print(f"Failures are logged in {FAILED_LOG}; run in backfill mode to retry them.")
+
+
+# ----------------------------- Main -------------------------------------------
+def main():
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="replace")   # odd subject characters can't crash printing
+
+    mode = sys.argv[1].lower() if len(sys.argv) > 1 else RUN_MODE
+    if mode not in ("backfill", "watch"):
+        print(f"Unknown run mode {mode!r}; use 'backfill' or 'watch'.")
+        return
+
+    client = ollama.Client(host=OLLAMA_HOST, timeout=OLLAMA_TIMEOUT)
+    service = build("gmail", "v1", credentials=get_creds())
+
+    labels = Labels(service)
+    try:
+        source_id = labels.set_source(LABEL_TO_PROCESS)
+    except ValueError as error:
+        print(error)
+        return
+    print(f"Mode: {mode}. Processing label: {LABEL_TO_PROCESS} (id: {source_id})")
+    if REPROCESS_MAIL:
+        print("Reprocessing: already-labeled messages will be classified again.")
+    print()
+
+    labels.get_or_create(LABEL_ROOT)                # parent label so AI/... nests in the sidebar
+    labels.get_or_create(PAPERLESS_LABEL)
+    if ADD_YEAR_LABEL:
+        labels.get_or_create(f"{LABEL_ROOT}/Year")
+
+    if mode == "watch":
+        run_watch(service, client, labels, source_id)
+    else:
+        run_backfill(service, client, labels, source_id)
 
 
 if __name__ == "__main__":
